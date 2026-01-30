@@ -1,0 +1,352 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+// Simple password hashing using Web Crypto API
+async function hashPassword(password: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  const passwordHash = await hashPassword(password);
+  return passwordHash === hash;
+}
+
+// Generate a simple session token
+function generateSessionToken(): string {
+  const array = new Uint8Array(32);
+  crypto.getRandomValues(array);
+  return Array.from(array, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+serve(async (req) => {
+  // Handle CORS preflight
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+    if (!supabaseUrl || !supabaseServiceKey) {
+      console.error("Missing required env vars", { hasUrl: !!supabaseUrl, hasServiceRole: !!supabaseServiceKey });
+      return new Response(
+        JSON.stringify({ error: "Server not configured" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+    const body = await req.json();
+    const {
+      action,
+      mobile_number,
+      password,
+      full_name,
+      username,
+      date_of_birth,
+      session_token,
+    } = body ?? {};
+
+    // Admin session validation (used by the admin panel route guard)
+    if (action === "admin_validate") {
+      if (!session_token) {
+        return new Response(
+          JSON.stringify({ error: "Session token is required" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const { data: sessionRow, error: sessionErr } = await supabase
+        .from("user_sessions")
+        .select("user_id, expires_at, is_active")
+        .eq("session_token", session_token)
+        .eq("is_active", true)
+        .maybeSingle();
+
+      if (sessionErr || !sessionRow) {
+        return new Response(
+          JSON.stringify({ error: "Invalid or expired session" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const expiresAt = new Date(sessionRow.expires_at);
+      if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+        return new Response(
+          JSON.stringify({ error: "Invalid or expired session" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const userId = sessionRow.user_id;
+
+      const [{ data: profile, error: profileError }, { data: userRoles, error: rolesError }] = await Promise.all([
+        supabase.from("profiles").select("*").eq("id", userId).maybeSingle(),
+        supabase.from("user_roles").select("role").eq("user_id", userId),
+      ]);
+
+      if (profileError || !profile) {
+        return new Response(
+          JSON.stringify({ error: "Profile not found" }),
+          { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      if (rolesError) {
+        console.error("Admin roles lookup error:", rolesError);
+        return new Response(
+          JSON.stringify({ error: "Failed to validate roles" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          user: profile,
+          roles: userRoles?.map((r) => r.role) || [],
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Mobile auth requires mobile_number + password
+    if (!mobile_number || !password) {
+      return new Response(
+        JSON.stringify({ error: "Mobile number and password are required" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (action === "signup") {
+      if (!full_name || !username) {
+        return new Response(
+          JSON.stringify({ error: "Full name and username are required for signup" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Validate username format
+      const usernameRegex = /^[a-zA-Z0-9_]{3,30}$/;
+      if (!usernameRegex.test(username)) {
+        return new Response(
+          JSON.stringify({ error: "Username must be 3-30 characters and only contain letters, numbers, and underscores" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Check if mobile number already exists
+      const { data: existingUser } = await supabase
+        .from("user_credentials")
+        .select("id")
+        .eq("mobile_number", mobile_number)
+        .maybeSingle();
+
+      if (existingUser) {
+        return new Response(
+          JSON.stringify({ error: "This mobile number is already registered" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Check if username already exists
+      const { data: existingUsername } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("username", username.toLowerCase())
+        .maybeSingle();
+
+      if (existingUsername) {
+        return new Response(
+          JSON.stringify({ error: "This username is already taken" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Hash password and create user credentials
+      const passwordHash = await hashPassword(password);
+      
+      const { data: credentials, error: credError } = await supabase
+        .from("user_credentials")
+        .insert({
+          mobile_number,
+          password_hash: passwordHash,
+        })
+        .select()
+        .single();
+
+      if (credError) {
+        console.error("Credential creation error:", credError);
+        return new Response(
+          JSON.stringify({ error: "Failed to create account" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Create profile with optional date_of_birth
+      const profileData: Record<string, any> = {
+        id: credentials.id,
+        full_name,
+        mobile_number,
+        username: username.toLowerCase(),
+      };
+      
+      if (date_of_birth) {
+        profileData.date_of_birth = date_of_birth;
+      }
+
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .insert(profileData);
+
+      if (profileError) {
+        console.error("Profile creation error:", profileError);
+        // Rollback credentials if profile creation fails
+        await supabase.from("user_credentials").delete().eq("id", credentials.id);
+        return new Response(
+          JSON.stringify({ error: "Failed to create profile" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Generate session token and store in database
+      const sessionToken = generateSessionToken();
+      
+      const { error: sessionError } = await supabase
+        .from("user_sessions")
+        .insert({
+          user_id: credentials.id,
+          session_token: sessionToken,
+          expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days
+        });
+
+       if (sessionError) {
+         console.error("Session creation error:", sessionError);
+         return new Response(
+           JSON.stringify({ error: "Failed to create session" }),
+           { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+         );
+       }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          user: {
+            id: credentials.id,
+            mobile_number,
+            full_name,
+          },
+          session_token: sessionToken,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    
+    else if (action === "signin") {
+      // Get user credentials
+      const { data: credentials, error: credError } = await supabase
+        .from("user_credentials")
+        .select("*")
+        .eq("mobile_number", mobile_number)
+        .maybeSingle();
+
+      if (!credentials || credError) {
+        return new Response(
+          JSON.stringify({ error: "Invalid mobile number or password" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Verify password
+      const isValid = await verifyPassword(password, credentials.password_hash);
+      if (!isValid) {
+        return new Response(
+          JSON.stringify({ error: "Invalid mobile number or password" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Get profile
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", credentials.id)
+        .single();
+
+      // Get admin roles (using service role, bypasses RLS)
+      const { data: userRoles } = await supabase
+        .from("user_roles")
+        .select("role")
+        .eq("user_id", credentials.id);
+
+      // Generate session token and store in database
+      const sessionToken = generateSessionToken();
+      
+      // NOTE: We intentionally do NOT invalidate old sessions here.
+      // Previous behavior logged users out of other tabs/devices (including the admin panel)
+      // which caused intermittent 401 "Invalid or expired session" errors.
+
+      // Create new session
+      const { error: sessionError } = await supabase
+        .from("user_sessions")
+        .insert({
+          user_id: credentials.id,
+          session_token: sessionToken,
+          expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days
+        });
+
+       if (sessionError) {
+         console.error("Session creation error:", sessionError);
+         return new Response(
+           JSON.stringify({ error: "Failed to create session" }),
+           { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+         );
+       }
+
+      // Update online status
+      await supabase
+        .from("profiles")
+        .update({ is_online: true })
+        .eq("id", credentials.id);
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          user: {
+            id: credentials.id,
+            mobile_number,
+            full_name: profile?.full_name,
+            ...profile,
+          },
+          session_token: sessionToken,
+          roles: userRoles?.map(r => r.role) || [],
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    
+    else {
+      return new Response(
+        JSON.stringify({ error: "Invalid action" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+  } catch (error) {
+    console.error("Auth error:", error);
+    return new Response(
+      JSON.stringify({ error: "Internal server error" }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+});
