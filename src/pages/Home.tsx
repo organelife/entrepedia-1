@@ -112,6 +112,7 @@ export default function Home() {
 
   return (
     <MainLayout>
+      <PullToRefresh onRefresh={async () => { await fetchPosts(); }}>
       <div className="max-w-7xl mx-auto px-4 py-6">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* Left Sidebar - Quick Actions */}
@@ -230,9 +231,9 @@ export default function Home() {
                 <DiscoverySection />
                 
                 {loading ? (
-                  Array(3).fill(0).map((_, i) => (
-                    <Skeleton key={i} className="h-96 w-full rounded-xl" />
-                  ))
+                  <div className="flex justify-center py-12">
+                    <div className="animate-spin h-8 w-8 border-4 border-primary border-t-transparent rounded-full" />
+                  </div>
                 ) : posts.length > 0 ? (
                   posts.map((post) => (
                     <PostCard key={post.id} post={post} onUpdate={fetchPosts} />
@@ -263,6 +264,7 @@ export default function Home() {
           </aside>
         </div>
       </div>
+      </PullToRefresh>
     </MainLayout>
   );
 }
