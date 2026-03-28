@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Skeleton } from '@/components/ui/skeleton';
+import { PullToRefresh } from '@/components/ui/pull-to-refresh';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Dialog,
@@ -311,6 +312,7 @@ export default function Communities() {
 
   return (
     <MainLayout>
+      <PullToRefresh onRefresh={async () => { await fetchCommunities(); }}>
       <div className="max-w-4xl mx-auto px-4 py-6 space-y-6">
         {/* Header */}
         <div className="flex items-center justify-between">
@@ -498,6 +500,7 @@ export default function Communities() {
         </Dialog>
 
       </div>
+      </PullToRefresh>
     </MainLayout>
   );
 }
